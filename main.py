@@ -3,17 +3,20 @@ import cv2
 import logging
 from pathlib import Path
 import matplotlib.pyplot as plt
+import numpy as np
+from skimage.filters import threshold_otsu
 
 
 # ========== НАСТРОЙКИ ==========
 MODEL_PATH = 'models/tuomiokirja_lines_05122023.pt'
-SOURCE_PATH = 'images/img7.png'
+SOURCE_PATH = 'images/img4.jpg'
 OUTPUT_DIR = 'cropped_boxes'
 CONF_THRESHOLD = 0.3                                    # Порог уверенности (0-1)
 OVERLAP_THRESHOLD = 0.35                                # Порог пересечения (50% площади каждого бокса)
 IMG_FORMAT = 'png'                                      # Формат изображений (png/jpg)
 SCALE_COEFF = 2                                         # Коэффициент растяжения
 SCALE_BBOX = 0.01                                       # Процент увеличения ббокса
+SPACE_THRESHOLD_COEFF = 0.0025
 # ================================
 
 
@@ -68,6 +71,128 @@ def filter_boxes(boxes):
         if keep:
             filtered.append(current_box)
     return filtered
+
+
+def get_word_bboxes(img, x1, y1, x2, y2):
+    # Обрезаем область строки
+    crop = img[y1:y2, x1:x2]
+
+    # Преобразуем в градации серого и бинаризуем
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Применяем морфологическое закрытие для объединения символов
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+    # Считаем горизонтальную проекцию
+    projection = np.sum(closed, axis=0)
+    # projection = cv2.medianBlur(projection.astype(np.uint8), 3)
+
+    # Находим пробелы (адаптивный порог: % от максимальной высоты строки)
+    height = y2 - y1
+    space_threshold = SPACE_THRESHOLD_COEFF * height * 255  # % от максимально возможной суммы
+    # median_projection = np.mean(projection[projection > 0])
+    # space_threshold = 0.3 * median_projection  # 10% от медианной интенсивности символов
+
+    # plt.plot(projection)
+    # plt.axhline(y=space_threshold, color='r')
+    # plt.show()
+
+    space_indices = np.where(projection < space_threshold)[0]
+
+    # Определяем группы непрерывных пробелов
+    spaces = []
+    if len(space_indices) > 0:
+        start = space_indices[0]
+        end = start
+        for idx in space_indices[1:]:
+            if idx - end == 1:
+                end = idx
+            else:
+                spaces.append((start, end))
+                start = end = idx
+        spaces.append((start, end))
+
+    # Вычисляем границы слов
+    word_boxes = []
+    prev_end = 0
+    for (s_start, s_end) in spaces:
+        if s_start > prev_end:
+            word_boxes.append((prev_end, 0, s_start, closed.shape[0]))
+        prev_end = s_end
+
+    # Добавляем последнее слово
+    if prev_end < closed.shape[1]:
+        word_boxes.append((prev_end, 0, closed.shape[1], closed.shape[0]))
+
+    # Фильтруем мелкие артефакты и преобразуем в глобальные координаты
+    width = x2 - x1
+    min_word_width = width * 0.01  # Минимальная ширина слова в пикселях
+    filtered = []
+    for (wx1, wy1, wx2, wy2) in word_boxes:
+        if wx2 - wx1 >= min_word_width:
+            global_x1 = int((x1 + wx1) * 0.99)
+            global_y1 = int((y1 + wy1) * 0.99)
+            global_x2 = int((x1 + wx2) * 1.01)
+            global_y2 = int((y1 + wy2) * 1.01)
+            filtered.append((global_x1, global_y1, global_x2, global_y2))
+
+            cv2.rectangle(img, (global_x1, global_y1), (global_x2, global_y2), (0, 255, 0), 2)
+
+    return filtered
+
+
+def sort_word_bboxes(word_bboxes, line_overlap_threshold=0.7):
+    """
+    Сортирует bounding boxes по правилам:
+    1. По вертикали (по y1)
+    2. Для объектов в одной строке - по горизонтали (по x1)
+
+    :param word_bboxes: список кортежей (x1, y1, x2, y2)
+    :param line_overlap_threshold: порог перекрытия для определения одной строки (0.5 = 50%)
+    :return: отсортированный список координат
+    """
+    # Рассчитываем высоты bounding boxes
+    bboxes_with_height = [(box, box[3] - box[1]) for box in word_bboxes]
+
+    # Сортируем по вертикали (основной критерий - y1)
+    sorted_boxes = sorted(bboxes_with_height, key=lambda x: x[0][1])
+
+    # Группируем по строкам
+    lines = []
+    for box, h in sorted_boxes:
+        y_center = (box[1] + box[3]) / 2  # Центр по вертикали
+        matched = False
+
+        # Проверяем существующие линии
+        for line in lines:
+            # Берем эталонный bbox из линии
+            ref_box = line[0][0]
+            line_height = ref_box[3] - ref_box[1]
+
+            # Порог перекрытия с учетом высоты линии
+            threshold = line_height * line_overlap_threshold
+
+            # Проверяем вертикальное перекрытие
+            if ref_box[1] - threshold <= y_center <= ref_box[3] + threshold:
+                line.append((box, h))
+                matched = True
+                break
+
+        # Если не нашли подходящую линию, создаем новую
+        if not matched:
+            lines.append([(box, h)])
+
+    # Сортируем каждую линию по x1 и формируем итоговый список
+    result = []
+    for line in lines:
+        # Сортировка внутри линии
+        line_sorted = sorted(line, key=lambda x: x[0][0])
+        # Оставляем только координаты
+        result.extend([box for box, h in line_sorted])
+
+    return result
 
 
 def main():
@@ -134,42 +259,45 @@ def main():
                 class_name = model.names.get(class_id, 'unknown')   # Class ID (индекс класса)
                 y1 //= SCALE_COEFF                                   # Возвращение к исходному формату y1
                 y2 //= SCALE_COEFF                                   # Возвращение к исходному формату y2
-                x1 = int(x1 - SCALE_BBOX * x1)
-                y1 = int(y1 - SCALE_BBOX * y1)
-                x2 = int(x2 + SCALE_BBOX * x2)
-                y2 = int(y2 + SCALE_BBOX * y2)
 
                 # TODO Написать функцию разделяющую ббокс строки на ббоксы слов
-                # word_bboxes = get_word_bboxes(x1, y1, x2, y2)
+                word_bboxes = get_word_bboxes(annotated_img, x1, y1, x2, y2)
+                word_bboxes = sort_word_bboxes(word_bboxes)
 
                 # TODO Сделать цикл вырезания каждого слова из полученного массива выше
-                # for x1, y1, x2, y2 in word_bboxes:
-                # Вырезаем изображение
-                try:
-                    cropped_img = original_img[y1:y2, x1:x2]
-                    if cropped_img.size == 0:
-                        logging.warning(f'Empty region detected in {img_path}')
-                        continue
+                for j, (x1, y1, x2, y2) in enumerate(word_bboxes):
+                    # Вырезаем изображение
+                    try:
+                        # Проверка координат
+                        h, w = original_img.shape[:2]
+                        x1, y1 = max(0, x1), max(0, y1)
+                        x2, y2 = min(w, x2), min(h, y2)
 
-                    # Создаём файл
-                    output_name = f"{source_filename}_{class_name}_{i}_conf{box.conf[0]:.2f}.{IMG_FORMAT}"
-                    output_path = output_dir / output_name
+                        if x1 >= x2 or y1 >= y2:
+                            logging.warning(f"Invalid bbox {i}_{j} in {img_path}: {x1},{y1},{x2},{y2}")
+                            continue
 
-                    # Save the cropped image
-                    cv2.imwrite(str(output_path), cropped_img,
-                                [int(cv2.IMWRITE_JPEG_QUALITY), 100] if IMG_FORMAT == 'jpg' else [])
-                    logging.info(f'Saved: {output_path}')
+                        cropped_img = original_img[y1:y2, x1:x2]
+                        if cropped_img.size == 0:
+                            logging.warning(f"Empty crop in {img_path} for bbox {i}_{j}")
+                            continue
 
-                    # Draw on annotated image
-                    cv2.rectangle(annotated_img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        # Создаём файл
+                        output_name = f"{source_filename}_{class_name}_{i}_{j}_conf{box.conf[0]:.2f}.{IMG_FORMAT}"
+                        output_path = output_dir / output_name
 
-                except Exception as e:
-                    logging.error(f'Error processing box {i} in {img_path}: {str(e)}')
+                        # Save the cropped image
+                        cv2.imwrite(str(output_path), cropped_img,
+                                    [int(cv2.IMWRITE_JPEG_QUALITY), 100] if IMG_FORMAT == 'jpg' else [])
+                        logging.info(f"Saved word {i}_{j} to {output_path}")
 
-                # Save annotated image
-                annotated_path = output_dir / f"{source_filename}_annotated.{IMG_FORMAT}"
-                cv2.imwrite(str(annotated_path), annotated_img)
-                logging.info(f'Saved annotated: {annotated_path}')
+                    except Exception as e:
+                        logging.error(f'Error processing box {i}_{j} in {img_path}: {str(e)}')
+
+            # Save annotated image
+            annotated_path = output_dir / f"{source_filename}_annotated.{IMG_FORMAT}"
+            cv2.imwrite(str(annotated_path), annotated_img)
+            logging.info(f'Saved annotated: {annotated_path}')
 
 
 if __name__ == '__main__':
