@@ -9,7 +9,7 @@ from skimage.filters import threshold_otsu
 
 # ========== НАСТРОЙКИ ==========
 MODEL_PATH = 'models/tuomiokirja_lines_05122023.pt'
-SOURCE_PATH = 'images/img4.jpg'
+SOURCE_PATH = 'images/img25.jpg'
 OUTPUT_DIR = 'cropped_boxes'
 CONF_THRESHOLD = 0.3                                    # Порог уверенности (0-1)
 OVERLAP_THRESHOLD = 0.35                                # Порог пересечения (50% площади каждого бокса)
@@ -17,6 +17,7 @@ IMG_FORMAT = 'png'                                      # Формат изоб�
 SCALE_COEFF = 2                                         # Коэффициент растяжения
 SCALE_BBOX = 0.01                                       # Процент увеличения ббокса
 SPACE_THRESHOLD_COEFF = 0.0025
+MIN_SPACE_WIDTH = 0.03
 # ================================
 
 
@@ -102,6 +103,7 @@ def get_word_bboxes(img, x1, y1, x2, y2):
     space_indices = np.where(projection < space_threshold)[0]
 
     # Определяем группы непрерывных пробелов
+    width = x2 - x1
     spaces = []
     if len(space_indices) > 0:
         start = space_indices[0]
@@ -110,9 +112,12 @@ def get_word_bboxes(img, x1, y1, x2, y2):
             if idx - end == 1:
                 end = idx
             else:
-                spaces.append((start, end))
+                # Проверяем ширину пробела перед добавлением
+                if (end - start + 1) >= width * MIN_SPACE_WIDTH:
+                    spaces.append((start, end))
                 start = end = idx
-        spaces.append((start, end))
+        if (end - start + 1) >= width * MIN_SPACE_WIDTH:
+            spaces.append((start, end))
 
     # Вычисляем границы слов
     word_boxes = []
